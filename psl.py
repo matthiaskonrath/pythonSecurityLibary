@@ -89,11 +89,26 @@ import os
 import os.path
 import sys
 import time
+import datetime
+import struct
+import shlex
 
 # Threading
 from threading import Thread
+from threading import Lock
 from thread import start_new_thread, allocate_lock
 
+# SSH
+from optparse import OptionParser
+
+import paramiko
+
+"""
+from paramiko import DSSKey
+from paramiko import RSAKey
+from paramiko.ssh_exception import SSHException
+from paramiko.py3compat import u
+"""
 
 
 #############################################################################################
@@ -980,7 +995,7 @@ class RSA_ENC(object):
 	# Generate a new RSA private key
 	# Input:	Keysize (1024, 2048 or 4096)
 	# Return:	-
-	def generate_new_key(self, keysize=4069):
+	def generate_new_key(self, keysize=4096):
 		try:
 			if keysize != 1024 and keysize != 2048 and keysize != 4096:
 				print "Wrong keysize!"
@@ -994,6 +1009,14 @@ class RSA_ENC(object):
 		except Exception as e:
 			print "[+] Failed to generate RSA key!"
 			print "[-]", e
+
+
+	# Import a RSA key from a string
+	# Input:	string
+	# Return:	-
+	def import_key_string(self, key_string):
+		# Import RSA key
+		self.rsa_key = RSA.importKey(key_string)
 
 	# Import a RSA key from a file (public or private)
 	# Input:	Filename (and location) of the key
@@ -1323,67 +1346,157 @@ class base_aes_socket_encryption_class(object):
 		self.std_buffer = 4096
 		self.socket = sock
 
+
+
+	# Reciving function
+	# Input:	Size of the data that should be recived
+	# Return:	The recived data
+	def recvall(self, buffer_size):
+		# Helper function to recv n bytes or return None if EOF is hit
+		data = ''
+		while len(data) < buffer_size:
+			packet = self.socket.recv(buffer_size - len(data))
+			if not packet:
+				return None
+			data += packet
+		return data
+
+
 	# Send data over encrypted socket
-	# Input:	-
+	# Input:	Data that shoud be sent
 	# Return:	-
 	def send(self, data_to_send):
 		try:
 			# Encrypt the data with AES
 			encrypted_data = self.AES_encryption.encrypt(data_to_send)
 
-			# Chose the socket to send the encrypted data
-			self.socket.send(encrypted_data)
+			msg = struct.pack('>I', len(encrypted_data)) + encrypted_data
+			self.socket.sendall(msg)
 
 		except Exception as e:
 			print "[+] Failed to send encrypted data!"
 			print "[-]", e
 
-	# Recive encrypted data over socket
-	# Input:	Buffer size
-	# Return:	-
-	def recv(self, buffer_size=0):
-		try:
-			if buffer_size == 0:
-				buffer_size = self.std_buffer
 
-			encrypted_data = self.socket.recv(buffer_size)
+	# Recive encrypted data over socket
+	# Input:	-
+	# Return:	Recived data
+	def recv(self):
+		try:
+			# Read message length and unpack it into an integer
+			raw_msglen = self.recvall(4)
+			if not raw_msglen:
+				return None
+			msglen = struct.unpack('>I', raw_msglen)[0]
+			# Read the message data
+			allEncryptedData = self.recvall(msglen)
 
 			# Decrypt the data and return it
-			decrypted_data = self.AES_encryption.decrypt(encrypted_data)
+			decrypted_data = self.AES_encryption.decrypt(allEncryptedData)
 			return decrypted_data
 
 		except Exception as e:
 			print "[+] Failed to recive encrypted data!"
 			print "[-]", e
 
-	# Sends an encrypted aes file over socket
+
+
+	# Sends an encrypted (AES 256 CBC) file over socket
 	# Input:	Filename (and location) from the file to send
 	# Return:	-
 	def send_file(self, path_to_file):
 		try:
-			# Read all data from the file and encrypt it
-			data = open(path_to_file, "r").read()
-			encrypted_data = self.AES_encryption.encrypt(data)
+			# Read the whole file
+			fileContent = open(path_to_file,'rb')
+			# Define the blocksize to split the data
+			blocksize = 1024 * 1024 * 128
+			# Calculate how many parts will be created
+			parts = int(os.path.getsize(path_to_file) / blocksize)
+			part_counter = 0
+			# Create a hash object to generate the hash
+			SHA512 = hashlib.sha512()
 
-			self.socket.send(encrypted_data)
+			# Send information about the amount of parts that will be send
+			self.socket.sendall(struct.pack('>Q', parts))
+			# Generate all the blocks and send them
+			while part_counter <= parts:
+				# Get a datablock
+				partContent = fileContent.read(blocksize)
+				# Add the datablock to the hash object
+				SHA512.update(partContent)
+				# Encrypt the datablock
+				encPartContent = self.AES_encryption.encrypt(partContent)
+				# Generate a sturct and store the encrypted blocksize and the data in it
+				msg = struct.pack('>Q', len(encPartContent)) + encPartContent
+				# Send the generated struct
+				self.socket.sendall(msg)
+				part_counter += 1
+
+			# Send the file hash
+			hashedFile = SHA512.hexdigest()
+			# Generate the struct with the length and append the hash
+			hashMsg = struct.pack('>I', len(hashedFile)) + hashedFile
+			# Send the struct and the hash
+			self.socket.sendall(hashMsg)
+
 		except Exception as e:
 			print "[+] Failed to send the encrypted file!"
 			print "[-]", e
 
-	# Recive encrypted aes file over socket, stores it decrypted
+
+
+	# Recive a encrypted (AES 256 CBC) file over socket, stores it decrypted
 	# Input:	Filename (and location) to store the file
 	# Return:	-
 	def recv_file(self, path_to_file):
 		try:
-			encrypted_data = self.socket.recv(self.std_buffer)
+			# Get the amount of packets that will be send
+			parts = struct.unpack('>Q', self.recvall(8))[0]
+			part_counter = 0
+			# Empty the old file if it exists
+			open(path_to_file, 'w').close()
+			# The hash for checking the file
+			SHA512 = hashlib.sha512()
 
-			# Decrypt the data and store it in a file
-			decrypted_data = self.AES_encryption.decrypt(encrypted_data)
-			open(path_to_file, "w").write(decrypted_data)
+			# Recive all the encrypted datablocks and store them decrypted
+			while part_counter <= parts:
+				# Read message length and unpack
+				raw_msglen = self.recvall(8)
+				msglen = struct.unpack('>Q', raw_msglen)[0]
+				# Read the message data
+				encryptedData = self.recvall(msglen)
+				# Decrypt the data and store it in a file
+				# If this is done every block far less memory is used and the overall performance is higher
+				decryptedData = self.AES_encryption.decrypt(encryptedData)
+				# Create file hash
+				SHA512.update(decryptedData)
+				open(path_to_file,'a').write(decryptedData)
+
+				# Increament the part counter
+				part_counter += 1
+
+			# Check the file hash
+			generatedHash = SHA512.hexdigest()
+			# Recive the length of the hash length
+			raw_hashlen = self.recvall(4)
+			# Get the hash length from the struct
+			hashlen = struct.unpack('>I', raw_hashlen)[0]
+			# Recive the complete hash
+			sha512fileHash = self.recvall(hashlen)
+
+			# Check if the two hashes match
+			# (0 means the transfare was successful, 1 mens that the hashes not match)
+			if sha512fileHash == generatedHash:
+				return 0
+			else:
+				return 1
+
 
 		except Exception as e:
 			print "[+] Failed to recive the encrypted file!"
 			print "[-]", e
+
+
 
 	# Close the socket
 	# Input:	-
@@ -1795,138 +1908,235 @@ class socket_encryption_authentication_rsa_aes(base_aes_socket_encryption_class)
 #############################################################################################
 
 
+
 #############################################################################################
 ###				Socket - RSA - AES - Encryption and Authentication with DH      	      ###
 ###									With a socket										  ###
 #############################################################################################
-
-# Class for an encrypted RSA - AES connection and Authentication with Diffie Hellam for extra encryption
+"""
+	Description:
+		This class uses very strong encryption protocols (RSA 4096, AES 256 CBC, Diffie Hellman).
+	Function:
+		The AES 256 CBC key is exchanged by creating a encrypted socket with RSA 4096
+		authentication and gernerating the key is done by using diffie hellman.
+	Safety:
+		An attacker would ether need to break RSA 4096 and Diffie Hellman or AES 256 CBC.
+		Both attackts are very unlikely.
+"""
 class socket_encryption_authentication_rsa_aes_dh(base_aes_socket_encryption_class):
-
-	# Initialize the class
-	# Input:	Socket
-	# Return:	-
+	"""
+		Description:
+			Class initialisation, by creating a base class object and a diffie hellman object.
+			Here is also the "no key was found" message which should signalise that the clients
+			public RSA key was not found.
+		Input:
+			Socket
+		Return:
+			None
+	"""
 	def __init__(self, sock):
 		# Initialize with base class constructor
 		base_aes_socket_encryption_class.__init__(self, sock)
 		# Generate DH private key
 		self.diffieHellmanKey = DiffieHellman()
-		# Set No key found message
+		# Set no key found message
 		self.msg_no_key_found = "NO PUBLIC KEY FILE FOUND"
 
-	# Connect to server and start with RSA encryption and authentication
-	# Input:	Name of the file on the server in with my personal public key is stored
-	# Input:	Personal RSA keyfile (private key)
-	# Input:	Partners RSA keyfile (public key)
-	# Return:	-
-	def client_key_exchange(self,authentication_name, personal_rsa_keyfile, partners_rsa_keyfile):
-		try:
-			# Store RSA keyfiles for debuging and other methods
-			self.personal_rsa = RSA_ENC()
-			self.personal_rsa.import_key(personal_rsa_keyfile)
-			self.partner_rsa = RSA_ENC()
-			self.partner_rsa.import_key(partners_rsa_keyfile)
 
-			# Name of the public key file stored localy on the server
+
+	"""
+		Description:
+			Client side authentication protocol.
+		Input 0:
+			Name of the facility so the server can set the appropriate RSA key
+		Input 1:
+			Array which contains the clients private and the servers public key
+		Return:
+			None
+	"""
+	def client_key_exchange(self,authentication_name, keyDictionary):
+		try:
+			"""
+				Authenticate with RSA 4096
+			"""
+			# Import the RSA keys
+			if (authentication_name + "_priv") in keyDictionary and "Server_pub" in keyDictionary:
+				own_rsa_keystring = keyDictionary[(authentication_name + "_priv")]
+				partners_rsa_keystring = keyDictionary["Server_pub"]
+			else:
+				self.socket.close()
+				print "[+] Could not import RSA key strings!"
+
+			# Create the RSA objects with the key strings
+			self.personal_rsa = RSA_ENC()
+			self.personal_rsa.import_key_string(own_rsa_keystring)
+			self.partner_rsa = RSA_ENC()
+			self.partner_rsa.import_key_string(partners_rsa_keystring)
+
+
+			# Name of the public on the server (so the server knows which certificat he should use)
 			self.authentication_name = authentication_name
 
-			# Send encrypted authentication name (Server searches localy for a file with the same name -> should contain your public key)
+			# Send encrypted authentication name
 			self.encrypted_authentication_name = self.partner_rsa.encrypt(self.authentication_name)
 			self.socket.send(self.encrypted_authentication_name)
 
-			# Definition of the needed variables to hold the keys
+			"""
+				Diffie hellman key exchange
+			"""
+			# Definition of the needed variables to hold the diffie hellman keys
 			self.server_side_key_dh = ""
 			self.enc_server_side_key_dh = ""
 			self.client_side_key_dh = str (self.diffieHellmanKey.publicKey)
 			self.enc_client_side_key_dh = ""
 
-			# Recive encrypted server side Diffie Hellman key
+			# Recive encrypted server side diffie hellman key
 			self.enc_server_side_key_dh = self.socket.recv(self.std_buffer)
 
-			# Check if server finds public key file
+			# Check if server has found the public (if not close the connection)
 			if self.enc_server_side_key_dh == self.msg_no_key_found:
 				print "[+] Server found no public key file!"
 				self.close_connection()
 				exit(1)
 
-			# Decrypt server side Diffie Hellman key
+			# Recive encrypted server side diffie hellman key and decrypt it
 			self.server_side_key_dh = self.personal_rsa.decrypt_aes(str (self.enc_server_side_key_dh))
 
-			# Send encrypted client side Diffie Hellman key
+			# Send encrypted client side diffie hellman key
 			self.enc_client_side_key_dh = self.partner_rsa.encrypt_aes(self.client_side_key_dh)
 			self.socket.send(self.enc_client_side_key_dh)
 
+			"""
+				Set up the AES 256 CBC encrypted connection
+			"""
 			# Generate shared AES key
 			self.diffieHellmanKey.genKey(long (self.server_side_key_dh))
 			self.AES_encryption = AESCipher(self.diffieHellmanKey.key)
 
+
+			"""
+				Exception catching
+			"""
+		# Close connection if keyboard interupt was detected
 		except KeyboardInterrupt:
 			print "[+] Keyboard interrupt!"
 			self.socket.close()
 			exit(1)
 
+		# Close connection if another error occourred
 		except Exception as e:
 			print "[+] Failed to connect to server!"
 			print "[-]", e
 			self.socket.close()
 
-	# Wait for clients to connect and start RSA encryption and authentication
-	# Input:	Personal RSA keyfile (private key)
-	# Return:	-
-	def server_key_exchange(self, personal_rsa_keyfile):
-		try:
-			# Import own RSA keyfile
-			self.personal_rsa = RSA_ENC()
-			self.personal_rsa.import_key(personal_rsa_keyfile)
 
-			# Recive encrypted filename which contains the public key of the user
+
+	"""
+		Description:
+			Server side authentication protocol.
+		Input:
+			Array which contains the servers private and the clients public key
+		Return:
+			None
+	"""
+	def server_key_exchange(self, keyDictionary):
+		try:
+			"""
+				Authenticate with RSA 4096
+			"""
+			# Import the RSA keys
+			if "Server_priv" in keyDictionary:
+				self.rsa_key_string = keyDictionary["Server_priv"]
+			else:
+				self.socket.close()
+				print "[+] Could not import own RSA private key!"
+
+			# Create a RSA object with the key string
+			self.personal_rsa = RSA_ENC()
+			self.personal_rsa.import_key_string(self.rsa_key_string)
+
+			# Recive encrypted name of the facility to set the appropriate RSA key
 			self.encrypted_authentication_name = self.socket.recv(self.std_buffer)
 			self.authentication_name =  self.personal_rsa.decrypt(self.encrypted_authentication_name)
 
-			# Check if public key file exists
-			if os.path.isfile(self.authentication_name):
-				# Store authentication name
-				self.partner_rsa = RSA_ENC()
-				self.partner_rsa.import_key(self.authentication_name)
-
-
-				# Definition of the needed variables to hold the keys
-				self.bufferd_dh = ""
-				self.server_side_key_dh = str (self.diffieHellmanKey.publicKey)
-				self.enc_server_side_key_dh = ""
-				self.client_side_key_dh = ""
-				self.enc_client_side_key_dh = ""
-
-				# Send encrypted server side Diffie Hellman key
-				self.enc_server_side_key_dh = self.partner_rsa.encrypt_aes(str (self.server_side_key_dh))
-				self.socket.send(self.enc_server_side_key_dh)
-
-				# Recive encrypted client side Diffie Hellman key and decrypt it
-				self.enc_client_side_key_dh = self.socket.recv(self.std_buffer)
-				self.client_side_key_dh = self.personal_rsa.decrypt_aes(self.enc_client_side_key_dh)
-
-				# Generate shared AES key
-				self.diffieHellmanKey.genKey(long (self.client_side_key_dh))
-				self.AES_encryption = AESCipher(self.diffieHellmanKey.key)
-
+			# Import the RSA key for the client from the array
+			if (self.authentication_name + "_pub") in keyDictionary:
+				self.authentication_certificat = keyDictionary[(self.authentication_name + "_pub")]
+			# If the server was not able the retrieve the RSA key the connection will be closed
 			else:
+				self.authentication_certificat = "NO CERTIFICAT FOUND!"
 				self.socket.send(self.msg_no_key_found)
 				self.socket.close()
 				print "[+] Could not import patners RSA public key!"
 
+			# Create the RSA object with the client RSA key string
+			self.partner_rsa = RSA_ENC()
+			self.partner_rsa.import_key_string(self.authentication_certificat)
+
+			"""
+				Diffie hellman key exchange
+			"""
+			# Definition of the needed variables to hold the diffie hellman keys
+			self.bufferd_dh = ""
+			self.server_side_key_dh = str (self.diffieHellmanKey.publicKey)
+			self.enc_server_side_key_dh = ""
+			self.client_side_key_dh = ""
+			self.enc_client_side_key_dh = ""
+
+			# Send encrypted server side diffie hellman key
+			self.enc_server_side_key_dh = self.partner_rsa.encrypt_aes(str (self.server_side_key_dh))
+			self.socket.send(self.enc_server_side_key_dh)
+
+			# Recive encrypted client side diffie hellman key and decrypt it
+			self.enc_client_side_key_dh = self.socket.recv(self.std_buffer)
+			self.client_side_key_dh = self.personal_rsa.decrypt_aes(self.enc_client_side_key_dh)
+
+			"""
+				Set up the AES 256 CBC encrypted connection
+			"""
+			# Generate shared AES key
+			self.diffieHellmanKey.genKey(long (self.client_side_key_dh))
+			self.AES_encryption = AESCipher(self.diffieHellmanKey.key)
+
+			"""
+				Exception catching
+			"""
+		# Close connection if keyboard interupt was detected
 		except KeyboardInterrupt:
 			print "[+] Keyboard interrupt!"
 			self.socket.close()
 			exit(1)
 
+		# Close connection if another error occourred
 		except Exception as e:
 			print "[+] Failed to connect to client!"
 			print "[-]", e
 			self.socket.close()
 
-	# Prints debug information about the key exchange
-	# Input:	-
-	# Return:	-
+
+
+	"""
+		Description:
+			Returns the name of the facility and the RSA public key string.
+			This function only exists for logging the connection.
+		Input:
+			None
+		Return:
+			Name of the facility / RSA public key string
+	"""
+	def getFacilityNameAndCertificat(self):
+		return (self.authentication_name, self.authentication_certificat)
+
+
+
+	"""
+		Description:
+			Prints debug information about the key exchange.
+		Input:
+			None
+		Return:
+			None
+	"""
 	def debug(self):
 		try:
 			# Print connection information
@@ -1974,4 +2184,140 @@ class socket_encryption_authentication_rsa_aes_dh(base_aes_socket_encryption_cla
 #############################################################################################
 ###				Socket - RSA - AES - Encryption and Authentication with DH      	      ###
 ###									With a socket										  ###
+#############################################################################################
+
+
+
+#############################################################################################
+###				 			SSH - Server / Client Connection    	 			      	  ###
+#############################################################################################
+"""
+	Description:
+		This class is used to set up a command and control server which uses SSH
+		to control his clients.
+	Function:
+		The connections are only established with a RSA 4096 bit certificat.
+"""
+class ssh_python(object):
+	"""
+		Description:
+			Initialisation of the paramiko ssh object to establish the connections.
+	"""
+	def __init__(self):
+		self.ssh_socket = paramiko.SSHClient()
+
+
+
+	"""
+		Description:
+			This function generates a private and a public RSA key and stores it in a file.
+		Input 0:
+			RSA keysize (4096 should be used)
+		Input 1:
+			Filename to store the keys
+	"""
+	def generateKeyPair(self, bits, filename):
+		self.bits = bits
+		# Generate private key
+		self.rsa_private_key = paramiko.RSAKey.generate(bits=self.bits, progress_func = None)
+		# Store private key in a file
+		self.rsa_private_key.write_private_key_file(filename, password = "")
+
+		# Generating public key
+		self.rsa_public_key = paramiko.RSAKey(filename=filename, password="")
+		# Store the public key
+		with open("%s.pub" % filename, 'w') as f:
+			f.write("%s %s" % (self.rsa_public_key.get_name(), self.rsa_public_key.get_base64()))
+
+
+
+	"""
+		Description:
+			This function private RSA key.
+		Input:
+			Filename where the RSA private key is stored
+		Return:
+			None
+	"""
+	def import_RSA_Private_KEY(self, keyFile):
+		self.rsa_private_key = paramiko.RSAKey.from_private_key_file(keyFile)
+		self.rsa_public_key = paramiko.RSAKey(filename=keyFile, password="")
+
+
+
+	"""
+		Description:
+			This function returns the fingerprint of the RSA key.
+		Return:
+			RSA fingerprint string
+	"""
+	def getFingerprint(self):
+		hash = paramiko.py3compat.u(hexlify(self.rsa_public_key.get_fingerprint()))
+		return (":".join([ hash[i:2+i] for i in range(0, len(hash), 2)]))
+
+
+
+	"""
+		Description:
+			Establishes a connection to the SSH server.
+		Input 0:
+			IP address of the server
+		Input 1:
+			Port where the SSH server listens
+		Input 2:
+			Username
+		Input 3:
+			Filename where the RSA key is stored
+	"""
+	def connectToServer(self, IP_ADDRESS, PORT_ADDRESS, USERNAME, RSA_Key_File):
+		self.ssh_socket.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+		self.ssh_socket.connect(IP_ADDRESS, PORT_ADDRESS, username=USERNAME, password=None, key_filename=RSA_Key_File, timeout=4)
+
+
+
+	"""
+		Description:
+			Execute a command on the server.
+		Input 0:
+			Commad that should be executed
+		Return:
+			(Command return, Error return)
+	"""
+	def executeOnServer(self, COMMAND):
+		ssh_stdin, ssh_stdout, ssh_stderr = self.ssh_socket.exec_command(COMMAND)
+		ssh_stdin.close()
+		return ssh_stdout.read(), ssh_stderr.read()
+
+
+
+	"""
+		Description:
+			Upload a file to the server.
+		Input 0:
+			Local file path
+		Input 1:
+			Remote file path
+	"""
+	def putFile(self, localFile, remoteFile):
+		sftp = self.ssh_socket.open_sftp()
+		sftp.put(localFile, remoteFile)
+		sftp.close()
+
+
+
+	"""
+		Description:
+			Download a file from the server.
+		Input 0:
+			Path of the remote file
+		Input 1:
+			Path of the local file
+	"""
+	def getFile(self, remoteFile, localFile):
+		sftp = self.ssh_socket.open_sftp()
+		sftp.get(remoteFile, localFile)
+		sftp.close()
+
+#############################################################################################
+###				 			SSH - Server / Client Connection    	 			      	  ###
 #############################################################################################
